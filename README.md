@@ -1,6 +1,8 @@
 # steam-free-notifier
 
-Ansible role that deploys a self-hosted bot to notify a Discord channel whenever free-to-keep games appear on **Steam** or **Epic Games**.
+self-hosted bot to notify a Discord channel whenever free-to-keep games appear on **Steam** or **Epic Games**.
+
+Packaged as Ansible role that deploys it 
 
 ![Discord embed example](https://img.shields.io/badge/Discord-webhook-5865F2?logo=discord&logoColor=white)
 
