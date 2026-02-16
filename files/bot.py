@@ -24,7 +24,7 @@ if not WEBHOOK:
             content = f.read()
             m = re.search(r"DISCORD_WEBHOOK=(\S+)", content)
             if m:
-                WEBHOOK = m.group(1).strip("'\"")  # strip quotes from cron template
+                WEBHOOK = m.group(1)
                 os.environ["DISCORD_WEBHOOK"] = WEBHOOK
     except Exception:
         WEBHOOK = None
@@ -345,9 +345,6 @@ def fetch_gamerpower():
                 continue
 
             title = item.get("title") or ""
-            # GamerPower appends "(Platform) Giveaway" to titles — strip it
-            title = re.sub(r"\s*\((?:Steam|Epic Games|PC)\)\s*Giveaway\s*$", "", title, flags=re.IGNORECASE).strip()
-            title = re.sub(r"\s*Giveaway\s*$", "", title, flags=re.IGNORECASE).strip()
             url = item.get("open_giveaway_url") or item.get("giveaway_url") or ""
 
             if looks_like_junk(title):
