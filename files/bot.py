@@ -446,7 +446,7 @@ def get_game_image(game):
 def notify(game):
     """Send Discord embed. Returns True only if Discord accepted it."""
     if not WEBHOOK:
-        print("⚠️  No DISCORD_WEBHOOK set, skipping.")
+        print("  No DISCORD_WEBHOOK set, skipping.")
         return False
 
     platform = game.get("platform", "Unknown")
@@ -482,12 +482,12 @@ def notify(game):
     try:
         resp = http_post(WEBHOOK, payload, timeout=10)
         if resp.status_code not in (200, 204):
-            print(f"⚠️  Discord POST failed ({resp.status_code}): {resp.text[:300]}")
+            print(f"  Discord POST failed ({resp.status_code}): {resp.text[:300]}")
             return False
-        print(f"✅ Notified: {name} ({platform})")
+        print(f" Notified: {name} ({platform})")
         return True
     except Exception as e:
-        print(f"⚠️  Notification failed: {e}")
+        print(f"  Notification failed: {e}")
         return False
 
 
