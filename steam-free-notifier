@@ -1,0 +1,744 @@
+#!/usr/bin/env python3
+"""
+steam-free-notifier v3.1
+Sources: Steam search API, Epic freeGamesPromotions API, GamerPower API
+
+Public-repo safe version:
+- no secret scraping from cron/system files
+- official-store URL allowlisting
+- sanitized notification error logging
+- cache keeps timestamps, not just an unordered set
+- source success/failure is tracked correctly
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urlparse
+
+import requests
+
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    print("Missing dependency: beautifulsoup4", file=sys.stderr)
+    print("Install with: pip install beautifulsoup4", file=sys.stderr)
+    sys.exit(1)
+
+# =====================================================================
+# CONFIGURATION
+# =====================================================================
+
+WEBHOOK = os.getenv("DISCORD_WEBHOOK", "").strip()
+CACHE = Path(os.getenv("STEAM_FREE_NOTIFIER_CACHE", "./data/seen.json")).expanduser()
+CACHE_MAX_SIZE = int(os.getenv("STEAM_FREE_NOTIFIER_CACHE_MAX", "2000"))
+HTTP_TIMEOUT = int(os.getenv("STEAM_FREE_NOTIFIER_TIMEOUT", "20"))
+MAX_STEAM_PAGES = int(os.getenv("STEAM_FREE_NOTIFIER_STEAM_PAGES", "5"))
+
+STEAM_SEARCH_URL = (
+    "https://store.steampowered.com/search/results/"
+    "?query&specials=1&maxprice=free&infinite=1"
+)
+EPIC_URL = (
+    "https://store-site-backend-static-ipv4.ak.epicgames.com/"
+    "freeGamesPromotions?locale=en-US&country=US&allowCountries=US"
+)
+GAMERPOWER_URL = "https://www.gamerpower.com/api/giveaways?type=game&sort-by=date"
+
+STEAM_TITLE_BLOCKLIST = [
+    "soundtrack",
+    "dlc",
+    "add-on",
+    "addon",
+    "pack",
+    "starter pack",
+    "season pass",
+    "expansion",
+    "cosmetic",
+    "skin",
+    "weapon",
+    "bundle",
+    "gift",
+    "demo",
+    "test server",
+    "beta",
+]
+
+ALLOWED_STORE_HOSTS = {
+    "Steam": {"store.steampowered.com"},
+    "Epic Games": {"store.epicgames.com"},
+}
+
+# =====================================================================
+# HTTP SESSION
+# =====================================================================
+
+SESSION = requests.Session()
+SESSION.headers.update(
+    {
+        "User-Agent": "steam-free-notifier/3.1 (selfhosted bot)",
+        "Accept": "*/*",
+    }
+)
+
+try:
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        backoff_factor=1.0,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET", "POST"),
+        raise_on_status=False,
+        respect_retry_after_header=True,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    SESSION.mount("https://", adapter)
+    SESSION.mount("http://", adapter)
+except Exception:
+    pass
+
+
+def http_get(url: str, headers: dict | None = None, timeout: int = HTTP_TIMEOUT) -> requests.Response:
+    last_response = None
+    for _ in range(2):  # one extra manual retry for 429 after adapter retries
+        response = SESSION.get(url, headers=headers, timeout=timeout)
+        last_response = response
+        if response.status_code != 429:
+            return response
+
+        retry_after = response.headers.get("Retry-After")
+        sleep_s = int(retry_after) if retry_after and retry_after.isdigit() else 15
+        print(f"[HTTP] 429 rate limited, sleeping {sleep_s}s")
+        time.sleep(sleep_s)
+
+    return last_response  # type: ignore[return-value]
+
+
+def http_post(url: str, payload: dict, timeout: int = HTTP_TIMEOUT) -> requests.Response:
+    return SESSION.post(url, json=payload, timeout=timeout)
+
+
+# =====================================================================
+# UTILS
+# =====================================================================
+
+def now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def safe_text(value: str | None, max_len: int) -> str:
+    if not value:
+        return ""
+    value = re.sub(r"\s+", " ", value.replace("\r", " ").replace("\n", " ")).strip()
+    value = "".join(ch for ch in value if ch >= " " or ch == "\u200b")
+    return value[: max_len - 1] + "…" if len(value) > max_len else value
+
+
+def looks_like_junk(title: str | None) -> bool:
+    t = (title or "").lower()
+    return any(k in t for k in STEAM_TITLE_BLOCKLIST)
+
+
+def normalize_steam_url(url: str | None) -> str:
+    if not url:
+        return ""
+    url = url.split("?")[0].rstrip("/")
+    match = re.match(r"(https://store\.steampowered\.com/(app|sub)/\d+)", url)
+    return match.group(1) if match else url
+
+
+def url_host(url: str | None) -> str:
+    if not url:
+        return ""
+    try:
+        return urlparse(url).netloc.lower()
+    except Exception:
+        return ""
+
+
+def is_allowed_store_url(url: str | None, platform: str) -> bool:
+    if not url:
+        return False
+
+    host = url_host(url)
+    if host not in ALLOWED_STORE_HOSTS.get(platform, set()):
+        return False
+
+    if platform == "Steam":
+        return bool(re.search(r"^https://store\.steampowered\.com/app/\d+/?$", url))
+    if platform == "Epic Games":
+        return url.startswith("https://store.epicgames.com/")
+    return False
+
+
+def slugify(text: str | None) -> str:
+    text = (text or "").strip().lower()
+    text = re.sub(r"[^a-z0-9]+", "-", text)
+    return text.strip("-") or "unknown"
+
+
+# =====================================================================
+# STEAM — search API for -100% discounted games + appdetails validation
+# =====================================================================
+
+STEAM_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/125.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://store.steampowered.com/",
+}
+
+
+def steam_app_is_paid_to_free(appid: str) -> bool:
+    """Validate via appdetails: type=game, original price > 0, current price = 0."""
+    try:
+        response = http_get(
+            f"https://store.steampowered.com/api/appdetails/?appids={appid}",
+            timeout=10,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        blob = data.get(str(appid), {})
+        if not blob.get("success"):
+            return False
+
+        details = blob.get("data", {})
+        if (details.get("type") or "").lower() != "game":
+            return False
+
+        price_overview = details.get("price_overview") or {}
+        final = price_overview.get("final")
+        initial = price_overview.get("initial")
+
+        if final is None or initial is None:
+            return False
+
+        return final == 0 and initial > 0
+    except Exception:
+        return False
+
+
+def fetch_steam() -> list[dict]:
+    """Paginate Steam search for -100% specials, validate each hit."""
+    games: list[dict] = []
+    seen_ids: set[str] = set()
+
+    for page in range(MAX_STEAM_PAGES):
+        start = page * 50
+        url = f"{STEAM_SEARCH_URL}&start={start}&count=50"
+
+        response = http_get(url, headers=STEAM_HEADERS)
+        response.raise_for_status()
+
+        html = (response.json().get("results_html") or "").strip()
+        if not html:
+            break
+
+        soup = BeautifulSoup(html, "html.parser")
+        rows = soup.select("a.search_result_row")
+        if not rows:
+            break
+
+        for row in rows:
+            title_el = row.select_one(".title")
+            discount_el = row.select_one(".discount_pct")
+            if not title_el:
+                continue
+
+            title = title_el.get_text(strip=True)
+            if not (discount_el and "-100%" in discount_el.get_text(strip=True)):
+                continue
+            if looks_like_junk(title):
+                continue
+
+            link = (row.get("href") or "").split("?")[0]
+            match = re.search(r"/app/(\d+)", link)
+            if not match:
+                continue
+
+            appid = match.group(1)
+            if appid in seen_ids:
+                continue
+            seen_ids.add(appid)
+
+            if not steam_app_is_paid_to_free(appid):
+                continue
+
+            store_url = normalize_steam_url(link)
+            if not is_allowed_store_url(store_url, "Steam"):
+                continue
+
+            games.append(
+                {
+                    "id": f"steam:{appid}",
+                    "name": title,
+                    "store": store_url,
+                    "platform": "Steam",
+                }
+            )
+            time.sleep(0.3)
+
+        time.sleep(0.5)
+
+    print(f"[Steam] Found {len(games)} validated paid→free games.")
+    return games
+
+
+# =====================================================================
+# EPIC — official freeGamesPromotions API
+# =====================================================================
+
+def fetch_epic() -> list[dict]:
+    games: list[dict] = []
+
+    print("[Epic] Fetching free games promotions...")
+    response = http_get(EPIC_URL, headers={"Accept": "application/json"})
+    response.raise_for_status()
+
+    elements = (
+        response.json()
+        .get("data", {})
+        .get("Catalog", {})
+        .get("searchStore", {})
+        .get("elements", [])
+    )
+
+    for game in elements:
+        try:
+            if not _epic_is_free_now(game):
+                continue
+
+            offer_type = (game.get("offerType") or "").upper()
+            if offer_type in {"ADD_ON", "DLC", "IN_GAME_ADD_ON"}:
+                continue
+
+            if not _epic_is_paid_to_free(game):
+                continue
+
+            title = game.get("title") or "Unknown Epic Game"
+            store_url = _epic_build_link(game)
+            if not is_allowed_store_url(store_url, "Epic Games"):
+                continue
+
+            until = _epic_free_until(game)
+            game_id = game.get("id") or f"epic:{slugify(title)}"
+
+            item = {
+                "id": f"epic:{game_id}",
+                "name": title,
+                "store": store_url,
+                "platform": "Epic Games",
+            }
+            if until:
+                item["free_until"] = until
+
+            games.append(item)
+
+        except Exception as exc:
+            print(f"[Epic] Skipping malformed element: {type(exc).__name__}")
+
+    print(f"[Epic] Found {len(games)} free-to-keep games.")
+    return games
+
+
+def _epic_is_free_now(game: dict) -> bool:
+    for block in (game.get("promotions") or {}).get("promotionalOffers") or []:
+        for offer in block.get("promotionalOffers") or []:
+            discount_setting = offer.get("discountSetting") or {}
+            if (
+                discount_setting.get("discountType") == "PERCENTAGE"
+                and discount_setting.get("discountPercentage") == 100
+            ):
+                return True
+    return False
+
+
+def _epic_free_until(game: dict) -> str | None:
+    for block in (game.get("promotions") or {}).get("promotionalOffers") or []:
+        for offer in block.get("promotionalOffers") or []:
+            discount_setting = offer.get("discountSetting") or {}
+            if (
+                discount_setting.get("discountType") == "PERCENTAGE"
+                and discount_setting.get("discountPercentage") == 100
+            ):
+                return offer.get("endDate")
+    return None
+
+
+def _epic_is_paid_to_free(game: dict) -> bool:
+    try:
+        total_price = (game.get("price") or {}).get("totalPrice") or {}
+        return total_price.get("discountPrice") == 0 and (total_price.get("originalPrice") or 0) > 0
+    except Exception:
+        return False
+
+
+def _epic_extract_slug(game: dict) -> str | None:
+    candidates: list[str] = []
+
+    product_slug = game.get("productSlug")
+    if product_slug:
+        candidates.append(product_slug.split("/")[-1])
+
+    catalog_ns = game.get("catalogNs") or {}
+    for mapping in catalog_ns.get("mappings", []):
+        page_slug = mapping.get("pageSlug")
+        if page_slug:
+            candidates.append(page_slug)
+
+    for mapping in game.get("offerMappings") or []:
+        page_slug = mapping.get("pageSlug")
+        if page_slug:
+            candidates.append(page_slug)
+
+    url_slug = game.get("urlSlug")
+    if url_slug:
+        candidates.append(url_slug)
+
+    for slug in candidates:
+        if not slug:
+            continue
+        if re.match(r"^[0-9a-f]{16,}$", slug.lower()):
+            continue
+        if re.match(r"^[0-9]+$", slug):
+            continue
+        if re.match(r"^[a-z0-9-]+$", slug.lower()):
+            return slug
+
+    return None
+
+
+def _epic_build_link(game: dict) -> str:
+    slug = _epic_extract_slug(game)
+    if slug:
+        return f"https://store.epicgames.com/p/{slug}"
+    return "https://store.epicgames.com/en-US/free-games"
+
+
+# =====================================================================
+# GAMERPOWER — supplementary aggregator
+# Only accepts official Steam/Epic links after extraction.
+# =====================================================================
+
+def fetch_gamerpower() -> list[dict]:
+    games: list[dict] = []
+
+    print("[GamerPower] Fetching giveaways...")
+    response = http_get(GAMERPOWER_URL, timeout=15)
+    response.raise_for_status()
+
+    data = response.json()
+    if not isinstance(data, list):
+        print("[GamerPower] Unexpected payload, skipping.")
+        return []
+
+    for item in data:
+        platforms = (item.get("platforms") or "").lower()
+        giveaway_type = (item.get("type") or "").lower()
+
+        if giveaway_type != "game":
+            continue
+
+        title = item.get("title") or ""
+        title = re.sub(
+            r"\s*\((?:Steam|Epic Games|PC)\)\s*Giveaway\s*$",
+            "",
+            title,
+            flags=re.IGNORECASE,
+        ).strip()
+        title = re.sub(r"\s*Giveaway\s*$", "", title, flags=re.IGNORECASE).strip()
+
+        if looks_like_junk(title):
+            continue
+
+        if "steam" in platforms:
+            store_url = _gamerpower_find_steam_link(item)
+            if store_url and is_allowed_store_url(store_url, "Steam"):
+                app_match = re.search(r"/app/(\d+)", store_url)
+                appid = app_match.group(1) if app_match else slugify(title)
+                games.append(
+                    {
+                        "id": f"steam:{appid}",
+                        "name": title,
+                        "store": store_url,
+                        "platform": "Steam",
+                    }
+                )
+
+        elif "epic" in platforms:
+            store_url = _gamerpower_find_epic_link(item)
+            if store_url and is_allowed_store_url(store_url, "Epic Games"):
+                games.append(
+                    {
+                        "id": f"epic:gamerpower:{slugify(title)}",
+                        "name": title,
+                        "store": store_url,
+                        "platform": "Epic Games",
+                    }
+                )
+
+    print(f"[GamerPower] Found {len(games)} Steam/Epic giveaways.")
+    return games
+
+
+def _gamerpower_find_steam_link(item: dict) -> str | None:
+    for field in ("open_giveaway_url", "giveaway_url", "description"):
+        value = item.get(field) or ""
+        match = re.search(r"https?://store\.steampowered\.com/app/(\d+)", value)
+        if match:
+            return f"https://store.steampowered.com/app/{match.group(1)}"
+    return None
+
+
+def _gamerpower_find_epic_link(item: dict) -> str | None:
+    for field in ("open_giveaway_url", "giveaway_url", "description"):
+        value = item.get(field) or ""
+        match = re.search(r"https?://store\.epicgames\.com/\S+", value)
+        if match:
+            return match.group(0).rstrip(".,;)")
+    return None
+
+
+# =====================================================================
+# CACHE
+# Stores: { "<game_key>": "<last_seen_iso>" }
+# Backward compatible with older list-based cache.
+# =====================================================================
+
+def load_seen() -> dict[str, str]:
+    try:
+        with CACHE.open(encoding="utf-8") as handle:
+            data = json.load(handle)
+
+        if isinstance(data, dict):
+            return {str(k): str(v) for k, v in data.items()}
+
+        if isinstance(data, list):
+            # Backward compatibility with old format
+            migrated = {str(key): now_utc_iso() for key in data}
+            print(f"[Cache] Migrated legacy list cache with {len(migrated)} entries.")
+            return migrated
+
+        print("[Cache] Unexpected cache format, starting fresh.")
+        return {}
+
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        print(f"[Cache] Load failed: {type(exc).__name__}")
+        return {}
+
+
+def save_seen(seen: dict[str, str]) -> None:
+    CACHE.parent.mkdir(parents=True, exist_ok=True)
+
+    if len(seen) > CACHE_MAX_SIZE:
+        trimmed_items = sorted(seen.items(), key=lambda item: item[1])[-CACHE_MAX_SIZE:]
+        seen = dict(trimmed_items)
+        print(f"[Cache] Trimmed to {len(seen)} entries")
+
+    tmp = CACHE.with_suffix(CACHE.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(seen, handle, indent=2, sort_keys=True)
+    tmp.replace(CACHE)
+
+
+# =====================================================================
+# DISCORD NOTIFICATION
+# =====================================================================
+
+PLATFORM_CONFIG = {
+    "Steam": {
+        "emoji": "🎮",
+        "color": 0x1B2838,
+        "icon": (
+            "https://cdn.cloudflare.steamstatic.com/steamcommunity/public/images/apps/"
+            "steam/steamcommunity_32.png"
+        ),
+    },
+    "Epic Games": {
+        "emoji": "🎯",
+        "color": 0x0078F2,
+        "icon": "https://static-assets-prod.epicgames.com/epic-store/static/favicon.ico",
+    },
+}
+
+
+def get_game_image(game: dict) -> str | None:
+    if game.get("platform") == "Steam":
+        match = re.search(r"/app/(\d+)", game.get("store", ""))
+        if match:
+            return f"https://cdn.cloudflare.steamstatic.com/steam/apps/{match.group(1)}/header.jpg"
+    return None
+
+
+def notify(game: dict) -> bool:
+    """Send Discord embed. Returns True only if Discord accepted it."""
+    if not WEBHOOK:
+        print("ERROR: DISCORD_WEBHOOK is not set.", file=sys.stderr)
+        return False
+
+    platform = game.get("platform", "Unknown")
+    name = safe_text(game.get("name", "Unknown"), 200)
+    url = (game.get("store") or "").strip()
+
+    if not is_allowed_store_url(url, platform):
+        print(f"[Notify] Skipping untrusted URL for {name}")
+        return False
+
+    config = PLATFORM_CONFIG.get(platform, {"emoji": "🎁", "color": 0x5865F2, "icon": None})
+    image = get_game_image(game)
+
+    until_line = ""
+    if game.get("free_until"):
+        until_line = f"\n\n⏳ Free until: {safe_text(str(game['free_until']), 60)}"
+
+    embed = {
+        "title": safe_text(f"{config['emoji']} {name}", 256),
+        "description": safe_text(
+            f"**Currently free to claim**\n\n[🔗 Claim on {platform}]({url}){until_line}",
+            4096,
+        ),
+        "url": url,
+        "color": config["color"],
+        "footer": {"text": platform},
+        "timestamp": now_utc_iso(),
+    }
+
+    if config.get("icon"):
+        embed["footer"]["icon_url"] = config["icon"]
+    if image:
+        embed["image"] = {"url": image}
+
+    payload = {
+        "username": "Captain Hook",
+        "avatar_url": "https://em-content.zobj.net/source/apple/391/hook_1fa9d.png",
+        "embeds": [embed],
+    }
+
+    try:
+        response = http_post(WEBHOOK, payload, timeout=10)
+        if response.status_code not in (200, 204):
+            print(f"⚠️ Discord POST failed with status {response.status_code}")
+            return False
+
+        print(f"✅ Notified: {name} ({platform})")
+        return True
+
+    except Exception as exc:
+        print(f"⚠️ Notification failed: {type(exc).__name__}")
+        return False
+
+
+# =====================================================================
+# MAIN
+# =====================================================================
+
+def make_key(game: dict) -> str:
+    game_id = game.get("id")
+    if game_id:
+        return str(game_id)
+
+    platform = game.get("platform", "Unknown")
+    url = game.get("store", "")
+    name = game.get("name", "")
+    return f"{platform}::{url or name}"
+
+
+def main() -> int:
+    print(f"[{datetime.now().isoformat()}] Starting free games scan...")
+
+    if not WEBHOOK:
+        print("ERROR: DISCORD_WEBHOOK is not set.", file=sys.stderr)
+        return 2
+
+    seen = load_seen()
+    print(f"[Cache] {len(seen)} previously seen games.")
+
+    all_games: list[dict] = []
+    sources_ok = 0
+
+    # Steam
+    try:
+        all_games.extend(fetch_steam())
+        sources_ok += 1
+    except Exception as exc:
+        print(f"[Steam] FAILED: {type(exc).__name__}: {exc}")
+
+    # Epic
+    try:
+        all_games.extend(fetch_epic())
+        sources_ok += 1
+    except Exception as exc:
+        print(f"[Epic] FAILED: {type(exc).__name__}: {exc}")
+
+    # GamerPower
+    try:
+        all_games.extend(fetch_gamerpower())
+        sources_ok += 1
+    except Exception as exc:
+        print(f"[GamerPower] FAILED: {type(exc).__name__}: {exc}")
+
+    if sources_ok == 0:
+        print("ERROR: All sources failed.", file=sys.stderr)
+        return 2
+
+    # Dedupe by stable key
+    deduped: list[dict] = []
+    seen_keys_this_run: set[str] = set()
+
+    for game in all_games:
+        if game.get("platform") == "Steam":
+            game["store"] = normalize_steam_url(game.get("store"))
+
+        key = make_key(game)
+        if key in seen_keys_this_run:
+            continue
+
+        seen_keys_this_run.add(key)
+        deduped.append(game)
+
+    print(f"[All] {len(deduped)} games after dedupe.")
+
+    new_games = [game for game in deduped if make_key(game) not in seen]
+
+    if not new_games:
+        print("✓ No new free-to-keep games.")
+    else:
+        print(f"[New] {len(new_games)} new games to notify!")
+        for game in new_games:
+            print(f"  → {game.get('name', '?')} ({game.get('platform')})")
+            if notify(game):
+                seen[make_key(game)] = now_utc_iso()
+            time.sleep(1)
+
+    save_seen(seen)
+    print(f"[{datetime.now().isoformat()}] Scan complete.")
+    return 0
+
+
+if __name__ == "__main__":
+    exit_code = 0
+    try:
+        exit_code = main()
+    except Exception as exc:
+        print(f"ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        exit_code = 1
+    sys.exit(exit_code)
